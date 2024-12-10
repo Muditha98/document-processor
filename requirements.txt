@@ -1,0 +1,17 @@
+fastapi 
+uvicorn 
+python-multipart 
+azure-ai-formrecognizer
+ python-dotenv 
+ pdf2image 
+ requests 
+ requests-toolbelt
+pydantic
+groq 
+langchain_groq
+pillow 
+pandas 
+azure-core
+PyPDF2
+poppler-utils
+
