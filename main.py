@@ -1,20 +1,21 @@
-# main.py
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Dict
 import json
-import requests
+import asyncio
 from azure.core.credentials import AzureKeyCredential
 from azure.ai.formrecognizer import DocumentAnalysisClient
 import os
 from dotenv import load_dotenv
-from datetime import datetime
 import base64
 from pdf2image import convert_from_bytes
-import tempfile
 import io
+from concurrent.futures import ThreadPoolExecutor
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -36,69 +37,47 @@ document_analysis_client = DocumentAnalysisClient(
 )
 
 ENADOC_BASE_URL = "https://qaenadoc.enadocapp.com/api"
-KEYS_OF_INTEREST = ["I.D. No.", "Employee Name", "Date Filed", "Reason For Leave:"]
 
-class TokenResponse(BaseModel):
-    access_token: str
-    refresh_token: str
+# Define field mappings
+FIELD_MAPPINGS = {
+    "I.D. No.": "ID Number",
+    "Employee Name": "Employee Name",
+    "Date Filed": "Date Filed",
+    "Reason For Leave:": "Reason"
+}
 
-class DocumentMetadata(BaseModel):
-    filename: str
-    library: str
-    tag_profile: str
+KEYS_OF_INTEREST = list(FIELD_MAPPINGS.keys())
 
-@app.post("/api/auth/url")
-async def get_auth_url():
-    url = f"{ENADOC_BASE_URL}/v3/authorization/url"
-    payload = {
-        'ClientId': os.getenv('ENADOC_CLIENT_ID'),
-        'RedirectUri': 'http://localhost:4200/callback'
-    }
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': f"Bearer {os.getenv('ENADOC_CLIENT_SECRET')}"
-    }
-    response = requests.post(url, headers=headers, data=payload)
-    return response.json()
+# Initialize ThreadPoolExecutor for CPU-bound tasks
+executor = ThreadPoolExecutor(max_workers=4)
 
-@app.post("/api/auth/token")
-async def get_token(code: str):
-    url = f"{ENADOC_BASE_URL}/v3/token"
-    payload = {
-        'client_secret': os.getenv('ENADOC_CLIENT_SECRET'),
-        'client_id': os.getenv('ENADOC_CLIENT_ID'),
-        'grant_type': 'authorization_code',
-        'code': code
-    }
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    response = requests.post(url, headers=headers, data=payload)
-    return response.json()
+async def generate_thumbnail(file_content: bytes) -> str:
+    """Generate thumbnail asynchronously using ThreadPoolExecutor."""
+    def _generate():
+        try:
+            images = convert_from_bytes(
+                file_content,
+                size=(400, 565),
+                first_page=1,
+                last_page=1,
+                thread_count=2
+            )
+            if images:
+                buffered = io.BytesIO()
+                images[0].save(buffered, format="PNG", optimize=True, quality=85)
+                return base64.b64encode(buffered.getvalue()).decode()
+        except Exception as e:
+            logger.error(f"Thumbnail generation error: {str(e)}")
+            return None
 
-@app.get("/api/libraries")
-async def get_libraries(token: str):
-    headers = {'Authorization': f'bearer {token}'}
-    response = requests.get(f"{ENADOC_BASE_URL}/v3/libraries", headers=headers)
-    return response.json()
+    return await asyncio.get_event_loop().run_in_executor(executor, _generate)
 
-@app.get("/api/tagprofiles")
-async def get_tag_profiles(token: str):
-    headers = {'Authorization': f'bearer {token}'}
-    response = requests.get(f"{ENADOC_BASE_URL}/v3/tagprofiles", headers=headers)
-    return response.json()
-
-@app.post("/api/process-document")
-async def process_document(
-    file: UploadFile = File(...),
-    metadata: str = Form(...),
-    token: str = Form(...)
-):
-    file_content = await file.read()
-    metadata_dict = json.loads(metadata)
-    
-    # Process with Azure Form Recognizer
+async def process_form_recognizer(file_content: bytes) -> Dict:
+    """Process document with Form Recognizer and map field names."""
     try:
         poller = document_analysis_client.begin_analyze_document(
-            "prebuilt-document", document=file_content
+            "prebuilt-document",
+            document=file_content
         )
         result = poller.result()
         
@@ -107,26 +86,38 @@ async def process_document(
             if kv_pair.key and kv_pair.value:
                 key = kv_pair.key.content.strip()
                 if key in KEYS_OF_INTEREST:
-                    extracted_data[key] = {
+                    # Map the original key to the desired output key
+                    mapped_key = FIELD_MAPPINGS[key]
+                    extracted_data[mapped_key] = {
                         'value': kv_pair.value.content.strip(),
-                        'confidence': kv_pair.confidence if hasattr(kv_pair, 'confidence') else None
+                        'confidence': getattr(kv_pair, 'confidence', None)
                     }
+        return extracted_data
+    except Exception as e:
+        logger.error(f"Form recognizer error: {str(e)}")
+        return {}
+
+@app.post("/api/process-document")
+async def process_document(
+    file: UploadFile = File(...),
+    metadata: str = Form(...),
+    token: str = Form(...)
+):
+    """Process a single document with optimized concurrent processing."""
+    try:
+        file_content = await file.read()
+        metadata_dict = json.loads(metadata)
         
-        # Generate thumbnail
-        thumbnail = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
-                tmp_file.write(file_content)
-                tmp_file.seek(0)
-                images = convert_from_bytes(file_content, size=(400, 565))
-                if images:
-                    img = images[0]
-                    buffered = io.BytesIO()
-                    img.save(buffered, format="PNG")
-                    thumbnail = base64.b64encode(buffered.getvalue()).decode()
-        except Exception as e:
-            print(f"Thumbnail generation error: {str(e)}")
-            
+        # Process form recognition and thumbnail generation concurrently
+        extracted_data_task = process_form_recognizer(file_content)
+        thumbnail_task = generate_thumbnail(file_content)
+        
+        # Wait for both tasks to complete
+        extracted_data, thumbnail = await asyncio.gather(
+            extracted_data_task,
+            thumbnail_task
+        )
+        
         return {
             "filename": file.filename,
             "extracted_data": extracted_data,
@@ -135,53 +126,66 @@ async def process_document(
         }
     
     except Exception as e:
+        logger.error(f"Document processing error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/upload-to-enadoc")
-async def upload_to_enadoc(
-    file: UploadFile = File(...),
+@app.post("/api/process-documents-batch")
+async def process_documents_batch(
+    files: List[UploadFile] = File(...),
     metadata: str = Form(...),
-    extracted_data: str = Form(...),
     token: str = Form(...)
 ):
+    """Process multiple documents concurrently with optimized batch processing."""
+    if len(files) > 10:  # Limit batch size for performance
+        raise HTTPException(
+            status_code=400,
+            detail="Maximum batch size is 10 documents"
+        )
+    
     try:
         metadata_dict = json.loads(metadata)
-        extracted_data_dict = json.loads(extracted_data)
         
-        index_mapping = {
-            "I.D. No.": 45,
-            "Employee Name": 46,
-            "Date Filed": 47,
-            "Reason For Leave:": 48
+        async def process_single_document(file: UploadFile):
+            try:
+                file_content = await file.read()
+                
+                # Process form recognition and thumbnail generation concurrently
+                extracted_data_task = process_form_recognizer(file_content)
+                thumbnail_task = generate_thumbnail(file_content)
+                
+                extracted_data, thumbnail = await asyncio.gather(
+                    extracted_data_task,
+                    thumbnail_task
+                )
+                
+                return {
+                    "filename": file.filename,
+                    "extracted_data": extracted_data,
+                    "thumbnail": thumbnail,
+                    "metadata": metadata_dict,
+                    "status": "success"
+                }
+            except Exception as e:
+                logger.error(f"Error processing {file.filename}: {str(e)}")
+                return {
+                    "filename": file.filename,
+                    "status": "error",
+                    "error": str(e)
+                }
+        
+        # Process all documents concurrently
+        tasks = [process_single_document(file) for file in files]
+        results = await asyncio.gather(*tasks)
+        
+        return {
+            "batch_size": len(files),
+            "results": results,
+            "successful": len([r for r in results if r.get("status") == "success"]),
+            "failed": len([r for r in results if r.get("status") == "error"])
         }
-        
-        indexes = {
-            "documentName": file.filename.replace('.pdf', ''),
-            "tagProfileId": int(metadata_dict["tag_profile_id"]),
-            "indexes": [
-                {"id": index_mapping[field_name], "value": field_value}
-                for field_name, field_value in extracted_data_dict.items()
-                if field_name in index_mapping
-            ]
-        }
-        
-        files = {
-            'indexes': ('', json.dumps(indexes), 'application/json'),
-            'document': (file.filename, await file.read(), 'application/pdf')
-        }
-        
-        response = requests.post(
-            f"{ENADOC_BASE_URL}/v3/documents/?type=simple",
-            headers={'Authorization': f'bearer {token}'},
-            files=files
-        )
-        
-        if response.status_code != 201:
-            raise HTTPException(status_code=response.status_code, detail=response.text)
-            
-        return {"status": "success"}
         
     except Exception as e:
+        logger.error(f"Batch processing error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
