@@ -275,6 +275,7 @@ async def health_check():
         logger.error(f"Health check failed: {str(e)}")
         raise HTTPException(status_code=500, detail="Service unhealthy")
 
+
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting FastAPI application")
@@ -286,4 +287,11 @@ if __name__ == "__main__":
 
 
 
-    
+
+
+
+
+
+
+
+
