@@ -1,4 +1,4 @@
-fastapi 
+satfastapi 
 uvicorn 
 python-multipart 
 azure-ai-formrecognizer
