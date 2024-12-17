@@ -425,22 +425,7 @@ async def health_check():
             detail=f"Service unhealthy: {str(e)}"
         )
 
-@app.get("/api/test-date-parsing/{date_string}")
-async def test_date_parsing(date_string: str):
-    """Test endpoint for date parsing functionality."""
-    try:
-        standardized_date = standardize_date_format(date_string)
-        return {
-            "original": date_string,
-            "standardized": standardized_date,
-            "status": "success"
-        }
-    except DateParsingError as e:
-        return {
-            "original": date_string,
-            "error": str(e),
-            "status": "error"
-        }
+
 
 if __name__ == "__main__":
     import uvicorn
